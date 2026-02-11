@@ -11,7 +11,9 @@ adamdotdevin
 fwang
 iamdavidhill
 jayair
+kitlangton
 kommander
 r44vc0rp
 rekram1-node
+-spider-yamet clawdbot/llm psychosis, spam pinging the team
 thdxr
