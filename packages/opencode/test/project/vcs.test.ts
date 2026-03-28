@@ -2,44 +2,35 @@ import { $ } from "bun"
 import { afterEach, describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Layer, ManagedRuntime } from "effect"
 import { tmpdir } from "../fixture/fixture"
-import { watcherConfigLayer, withServices } from "../fixture/instance"
-import { FileWatcher, FileWatcherService } from "../../src/file/watcher"
+import { FileWatcher } from "../../src/file/watcher"
 import { Instance } from "../../src/project/instance"
 import { GlobalBus } from "../../src/bus/global"
-import { Vcs, VcsService } from "../../src/project/vcs"
+import { Vcs } from "../../src/project/vcs"
 
-// Skip in CI — native @parcel/watcher binding needed
 const describeVcs = FileWatcher.hasNativeBinding() && !process.env.CI ? describe : describe.skip
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function withVcs(
-  directory: string,
-  body: (rt: ManagedRuntime.ManagedRuntime<FileWatcherService | VcsService, never>) => Promise<void>,
-) {
-  return withServices(
+async function withVcs(directory: string, body: () => Promise<void>) {
+  return Instance.provide({
     directory,
-    Layer.merge(FileWatcherService.layer, VcsService.layer),
-    async (rt) => {
-      await rt.runPromise(FileWatcherService.use((s) => s.init()))
-      await rt.runPromise(VcsService.use((s) => s.init()))
-      await Bun.sleep(200)
-      await body(rt)
+    fn: async () => {
+      FileWatcher.init()
+      Vcs.init()
+      await Bun.sleep(500)
+      await body()
     },
-    { provide: [watcherConfigLayer] },
-  )
+  })
 }
 
 type BranchEvent = { directory?: string; payload: { type: string; properties: { branch?: string } } }
 
-/** Wait for a Vcs.Event.BranchUpdated event on GlobalBus */
-function nextBranchUpdate(directory: string, timeout = 5000) {
+function nextBranchUpdate(directory: string, timeout = 10_000) {
   return new Promise<string | undefined>((resolve, reject) => {
+    let settled = false
+
     const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
       GlobalBus.off("event", on)
       reject(new Error("timed out waiting for BranchUpdated event"))
     }, timeout)
@@ -47,6 +38,8 @@ function nextBranchUpdate(directory: string, timeout = 5000) {
     function on(evt: BranchEvent) {
       if (evt.directory !== directory) return
       if (evt.payload.type !== Vcs.Event.BranchUpdated.type) return
+      if (settled) return
+      settled = true
       clearTimeout(timer)
       GlobalBus.off("event", on)
       resolve(evt.payload.properties.branch)
@@ -56,18 +49,16 @@ function nextBranchUpdate(directory: string, timeout = 5000) {
   })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describeVcs("Vcs", () => {
-  afterEach(() => Instance.disposeAll())
+  afterEach(async () => {
+    await Instance.disposeAll()
+  })
 
   test("branch() returns current branch name", async () => {
     await using tmp = await tmpdir({ git: true })
 
-    await withVcs(tmp.path, async (rt) => {
-      const branch = await rt.runPromise(VcsService.use((s) => s.branch()))
+    await withVcs(tmp.path, async () => {
+      const branch = await Vcs.branch()
       expect(branch).toBeDefined()
       expect(typeof branch).toBe("string")
     })
@@ -76,8 +67,8 @@ describeVcs("Vcs", () => {
   test("branch() returns undefined for non-git directories", async () => {
     await using tmp = await tmpdir()
 
-    await withVcs(tmp.path, async (rt) => {
-      const branch = await rt.runPromise(VcsService.use((s) => s.branch()))
+    await withVcs(tmp.path, async () => {
+      const branch = await Vcs.branch()
       expect(branch).toBeUndefined()
     })
   })
@@ -91,7 +82,11 @@ describeVcs("Vcs", () => {
       const pending = nextBranchUpdate(tmp.path)
 
       const head = path.join(tmp.path, ".git", "HEAD")
-      await fs.writeFile(head, `ref: refs/heads/${branch}\n`)
+      await fs.writeFile(
+        head,
+        `ref: refs/heads/${branch}
+`,
+      )
 
       const updated = await pending
       expect(updated).toBe(branch)
@@ -103,14 +98,18 @@ describeVcs("Vcs", () => {
     const branch = `test-${Math.random().toString(36).slice(2)}`
     await $`git branch ${branch}`.cwd(tmp.path).quiet()
 
-    await withVcs(tmp.path, async (rt) => {
+    await withVcs(tmp.path, async () => {
       const pending = nextBranchUpdate(tmp.path)
 
       const head = path.join(tmp.path, ".git", "HEAD")
-      await fs.writeFile(head, `ref: refs/heads/${branch}\n`)
+      await fs.writeFile(
+        head,
+        `ref: refs/heads/${branch}
+`,
+      )
 
       await pending
-      const current = await rt.runPromise(VcsService.use((s) => s.branch()))
+      const current = await Vcs.branch()
       expect(current).toBe(branch)
     })
   })

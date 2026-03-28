@@ -1,19 +1,20 @@
+import { GlobalBus } from "@/bus/global"
+import { disposeInstance } from "@/effect/instance-registry"
+import { Filesystem } from "@/util/filesystem"
+import { iife } from "@/util/iife"
 import { Log } from "@/util/log"
 import { Context } from "../util/context"
 import { Project } from "./project"
 import { State } from "./state"
-import { iife } from "@/util/iife"
-import { GlobalBus } from "@/bus/global"
-import { Filesystem } from "@/util/filesystem"
-import { disposeInstance } from "@/effect/instance-registry"
 
-interface Context {
+export interface InstanceContext {
   directory: string
   worktree: string
   project: Project.Info
 }
-const context = Context.create<Context>("instance")
-const cache = new Map<string, Promise<Context>>()
+
+const context = Context.create<InstanceContext>("instance")
+const cache = new Map<string, Promise<InstanceContext>>()
 
 const disposal = {
   all: undefined as Promise<void> | undefined,
@@ -52,7 +53,7 @@ function boot(input: { directory: string; init?: () => Promise<any>; project?: P
   })
 }
 
-function track(directory: string, next: Promise<Context>) {
+function track(directory: string, next: Promise<InstanceContext>) {
   const task = next.catch((error) => {
     if (cache.get(directory) === task) cache.delete(directory)
     throw error
@@ -79,6 +80,9 @@ export const Instance = {
     return context.provide(ctx, async () => {
       return input.fn()
     })
+  },
+  get current() {
+    return context.use()
   },
   get directory() {
     return context.use().directory

@@ -1,16 +1,17 @@
-import { BusEvent } from "@/bus/bus-event"
+import { Effect, Layer, ServiceMap, Stream } from "effect"
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { Bus } from "@/bus"
-import z from "zod"
-import { Log } from "@/util/log"
-import { Instance } from "./instance"
-import { InstanceContext } from "@/effect/instance-context"
+import { BusEvent } from "@/bus/bus-event"
+import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
+import { InstanceState } from "@/effect/instance-state"
+import { makeRuntime } from "@/effect/run-service"
 import { FileWatcher } from "@/file/watcher"
-import { git } from "@/util/git"
-import { Effect, Layer, ServiceMap } from "effect"
-
-const log = Log.create({ service: "vcs" })
+import { Log } from "@/util/log"
+import z from "zod"
 
 export namespace Vcs {
+  const log = Log.create({ service: "vcs" })
+
   export const Event = {
     BranchUpdated: BusEvent.define(
       "vcs.branch.updated",
@@ -22,63 +23,102 @@ export namespace Vcs {
 
   export const Info = z
     .object({
-      branch: z.string(),
+      branch: z.string().optional(),
     })
     .meta({
       ref: "VcsInfo",
     })
   export type Info = z.infer<typeof Info>
-}
 
-export namespace VcsService {
-  export interface Service {
+  export interface Interface {
     readonly init: () => Effect.Effect<void>
     readonly branch: () => Effect.Effect<string | undefined>
   }
-}
 
-export class VcsService extends ServiceMap.Service<VcsService, VcsService.Service>()("@opencode/Vcs") {
-  static readonly layer = Layer.effect(
-    VcsService,
+  interface State {
+    current: string | undefined
+  }
+
+  export class Service extends ServiceMap.Service<Service, Interface>()("@opencode/Vcs") {}
+
+  export const layer: Layer.Layer<Service, never, Bus.Service | ChildProcessSpawner.ChildProcessSpawner> = Layer.effect(
+    Service,
     Effect.gen(function* () {
-      const instance = yield* InstanceContext
-      let current: string | undefined
+      const bus = yield* Bus.Service
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
 
-      if (instance.project.vcs === "git") {
-        const currentBranch = async () => {
-          const result = await git(["rev-parse", "--abbrev-ref", "HEAD"], {
-            cwd: instance.project.worktree,
-          })
-          if (result.exitCode !== 0) return undefined
-          const text = result.text().trim()
-          return text || undefined
-        }
+      const git = Effect.fnUntraced(
+        function* (args: string[], opts: { cwd: string }) {
+          const handle = yield* spawner.spawn(
+            ChildProcess.make("git", args, { cwd: opts.cwd, extendEnv: true, stdin: "ignore" }),
+          )
+          const text = yield* Stream.mkString(Stream.decodeText(handle.stdout))
+          const code = yield* handle.exitCode
+          return { code, text }
+        },
+        Effect.scoped,
+        Effect.catch(() => Effect.succeed({ code: ChildProcessSpawner.ExitCode(1), text: "" })),
+      )
 
-        current = yield* Effect.promise(() => currentBranch())
-        log.info("initialized", { branch: current })
-
-        const unsubscribe = Bus.subscribe(
-          FileWatcher.Event.Updated,
-          Instance.bind(async (evt) => {
-            if (!evt.properties.file.endsWith("HEAD")) return
-            const next = await currentBranch()
-            if (next !== current) {
-              log.info("branch changed", { from: current, to: next })
-              current = next
-              Bus.publish(Vcs.Event.BranchUpdated, { branch: next })
+      const state = yield* InstanceState.make<State>(
+        Effect.fn("Vcs.state")((ctx) =>
+          Effect.gen(function* () {
+            if (ctx.project.vcs !== "git") {
+              return { current: undefined }
             }
+
+            const getBranch = Effect.fnUntraced(function* () {
+              const result = yield* git(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: ctx.worktree })
+              if (result.code !== 0) return undefined
+              const text = result.text.trim()
+              return text || undefined
+            })
+
+            const value = {
+              current: yield* getBranch(),
+            }
+            log.info("initialized", { branch: value.current })
+
+            yield* bus.subscribe(FileWatcher.Event.Updated).pipe(
+              Stream.filter((evt) => evt.properties.file.endsWith("HEAD")),
+              Stream.runForEach(() =>
+                Effect.gen(function* () {
+                  const next = yield* getBranch()
+                  if (next !== value.current) {
+                    log.info("branch changed", { from: value.current, to: next })
+                    value.current = next
+                    yield* bus.publish(Event.BranchUpdated, { branch: next })
+                  }
+                }),
+              ),
+              Effect.forkScoped,
+            )
+
+            return value
           }),
-        )
+        ),
+      )
 
-        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
-      }
-
-      return VcsService.of({
-        init: Effect.fn("VcsService.init")(function* () {}),
-        branch: Effect.fn("VcsService.branch")(function* () {
-          return current
+      return Service.of({
+        init: Effect.fn("Vcs.init")(function* () {
+          yield* InstanceState.get(state)
+        }),
+        branch: Effect.fn("Vcs.branch")(function* () {
+          return yield* InstanceState.use(state, (x) => x.current)
         }),
       })
     }),
   )
+
+  export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(CrossSpawnSpawner.defaultLayer))
+
+  const { runPromise } = makeRuntime(Service, defaultLayer)
+
+  export function init() {
+    return runPromise((svc) => svc.init())
+  }
+
+  export function branch() {
+    return runPromise((svc) => svc.branch())
+  }
 }
